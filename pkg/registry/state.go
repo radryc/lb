@@ -253,8 +253,8 @@ func (s *State) ListResponse() *pb.ListServicesResponse {
 
 func (s *State) reservePortLocked(serviceKey string, requested int32) (int32, error) {
 	if requested > 0 {
-		if requested < s.minExternalPort || requested > s.maxExternalPort {
-			return 0, fmt.Errorf("requested_external_port %d outside [%d, %d]", requested, s.minExternalPort, s.maxExternalPort)
+		if requested <= 0 || requested > 65535 {
+			return 0, fmt.Errorf("requested_external_port %d outside [1, 65535]", requested)
 		}
 		if owner, ok := s.usedPorts[requested]; ok && owner != serviceKey {
 			return 0, fmt.Errorf("requested_external_port %d already reserved by %q", requested, owner)

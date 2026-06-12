@@ -24,13 +24,13 @@ import (
 
 func main() {
 	var (
-		bindAddress  = flag.String("bind-address", envOrDefault("LB_BIND_ADDRESS", "0.0.0.0"), "listener bind address")
-		serviceBase  = flag.String("service-base", envOrDefault("LB_SERVICE_BASE", "edge"), "service name prefix for bootstrapped listeners")
-		account      = flag.String("account", envOrDefault("LB_ACCOUNT", "default"), "account/tenant for bootstrapped services")
-		bootstrap    = flag.String("bootstrap", envOrDefault("LB_BOOTSTRAP", ""), "bootstrap mapping: <external_port>=host:port[,host:port][;<external_port>=...]")
-		metricsAddr  = flag.String("metrics-addr", envOrDefault("LB_METRICS_ADDR", ":19090"), "Prometheus metrics listen address")
-		registryHTTP = flag.String("registry-http-addr", envOrDefault("LB_REGISTRY_HTTP_ADDR", "127.0.0.1:18081"), "local registry HTTP listen address")
-		registryGRPC = flag.String("registry-grpc-addr", envOrDefault("LB_REGISTRY_GRPC_ADDR", "0.0.0.0:15051"), "local registry gRPC listen address")
+		bindAddress   = flag.String("bind-address", envOrDefault("LB_BIND_ADDRESS", "0.0.0.0"), "listener bind address")
+		serviceBase   = flag.String("service-base", envOrDefault("LB_SERVICE_BASE", "edge"), "service name prefix for bootstrapped listeners")
+		account       = flag.String("account", envOrDefault("LB_ACCOUNT", "default"), "account/tenant for bootstrapped services")
+		bootstrap     = flag.String("bootstrap", envOrDefault("LB_BOOTSTRAP", ""), "bootstrap mapping: <external_port>=host:port[,host:port][;<external_port>=...]")
+		metricsAddr   = flag.String("metrics-addr", envOrDefault("LB_METRICS_ADDR", ":19090"), "Prometheus metrics listen address")
+		registryHTTP  = flag.String("registry-http-addr", envOrDefault("LB_REGISTRY_HTTP_ADDR", "127.0.0.1:18081"), "local registry HTTP listen address")
+		registryGRPC  = flag.String("registry-grpc-addr", envOrDefault("LB_REGISTRY_GRPC_ADDR", "0.0.0.0:15051"), "local registry gRPC listen address")
 		syncEvery     = flag.Duration("sync-every", durationFromEnv("LB_SYNC_EVERY", 2*time.Second), "state sync interval")
 		dialTimeout   = flag.Duration("dial-timeout", durationFromEnv("LB_DIAL_TIMEOUT", 3*time.Second), "backend dial timeout")
 		minPort       = flag.Int("min-external-port", 1, "minimum dynamic external port")
