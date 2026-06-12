@@ -100,10 +100,10 @@ func NewEngine(bindAddress, registryURL string, syncEvery, dialTimeout time.Dura
 		dialTimeout = 3 * time.Second
 	}
 	return &Engine{
-		bindAddress: bindAddress,
-		registryURL: registryURL,
-		syncEvery:   syncEvery,
-		dialTimeout: dialTimeout,
+		bindAddress:   bindAddress,
+		registryURL:   registryURL,
+		syncEvery:     syncEvery,
+		dialTimeout:   dialTimeout,
 		httpClient:    &http.Client{Timeout: 5 * time.Second},
 		metrics:       metrics,
 		proxyProtocol: proxyProtocol,
