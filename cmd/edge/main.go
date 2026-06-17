@@ -20,6 +20,7 @@ import (
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"github.com/rydzu/ainfra/lb/pkg/telemetry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 func main() {
@@ -49,6 +50,7 @@ func main() {
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
+	reflection.Register(grpcServer)
 	grpcLis, err := net.Listen("tcp", *registryGRPC)
 	if err != nil {
 		log.Fatalf("listen registry grpc %s: %v", *registryGRPC, err)
