@@ -11,7 +11,7 @@ Thumbs.db
 *.swo
 
 # Go binaries (anchored to root)
-/lb-edge
-/lb-proxy
-/lb-registry
-/lb-k8s-agent
+/edge
+/k8s-agent
+/proxy
+/registry
