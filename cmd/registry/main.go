@@ -13,6 +13,7 @@ import (
 	"github.com/rydzu/ainfra/lb/pkg/pb"
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 func main() {
@@ -27,6 +28,7 @@ func main() {
 	state := registry.NewState(int32(*minPort), int32(*maxPort))
 	grpcServer := grpc.NewServer()
 	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
+	reflection.Register(grpcServer)
 
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
