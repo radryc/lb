@@ -196,7 +196,7 @@ func (e *Engine) syncState(ctx context.Context) error {
 		}
 		for k, target := range d {
 			if existing, found := li.backends[k]; found {
-				if existing.stateValue() == stateDraining {
+				if s := existing.stateValue(); s == stateDraining || s == stateUnhealthy {
 					existing.markActive()
 				}
 				continue
