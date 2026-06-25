@@ -105,15 +105,19 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 	key := endpointResourceKey(ep.Namespace, ep.Name)
 	account, serviceName, requestedExternalPort, exposed := a.resolveIntent(ep)
 	if !exposed {
-		a.deregisterAll(ctx, key, account, serviceName)
+		a.deregisterAllRetryable(ctx, key, account, serviceName)
 		return
 	}
 
 	current := parseEndpoints(ep)
 	old := a.snapshotKnown(key)
 
+	// Only track successfully-registered endpoints so failures retry on next resync.
+	newKnown := make(map[string]Endpoint, len(current))
+
 	for epKey, entry := range current {
 		if _, exists := old[epKey]; exists {
+			newKnown[epKey] = entry
 			continue
 		}
 		_, err := a.rpc.RegisterService(ctx, &pb.RegisterServiceRequest{
@@ -125,7 +129,9 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 		})
 		if err != nil {
 			log.Printf("register %s/%s %s:%d failed: %v", ep.Namespace, serviceName, entry.IP, entry.Port, err)
+			continue
 		}
+		newKnown[epKey] = entry
 	}
 
 	for epKey, entry := range old {
@@ -140,10 +146,11 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 		})
 		if err != nil {
 			log.Printf("deregister %s/%s %s:%d failed: %v", ep.Namespace, serviceName, entry.IP, entry.Port, err)
+			newKnown[epKey] = entry
 		}
 	}
 
-	a.setKnown(key, current)
+	a.setKnown(key, newKnown)
 }
 
 func (a *Agent) handleDelete(ctx context.Context, obj interface{}) {
@@ -176,6 +183,28 @@ func (a *Agent) deregisterAll(ctx context.Context, key, account, serviceName str
 		}
 	}
 	a.clearKnown(key)
+}
+
+func (a *Agent) deregisterAllRetryable(ctx context.Context, key, account, serviceName string) {
+	old := a.snapshotKnown(key)
+	remaining := make(map[string]Endpoint)
+	for epKey, entry := range old {
+		_, err := a.rpc.DeregisterService(ctx, &pb.DeregisterServiceRequest{
+			Account:     account,
+			ServiceName: serviceName,
+			TargetIp:    entry.IP,
+			TargetPort:  entry.Port,
+		})
+		if err != nil {
+			log.Printf("deregister %s/%s %s:%d failed: %v", account, serviceName, entry.IP, entry.Port, err)
+			remaining[epKey] = entry
+		}
+	}
+	if len(remaining) == 0 {
+		a.clearKnown(key)
+	} else {
+		a.setKnown(key, remaining)
+	}
 }
 
 func (a *Agent) resolveIntent(ep *corev1.Endpoints) (account string, serviceName string, requestedExternalPort int32, exposed bool) {
