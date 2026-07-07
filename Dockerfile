@@ -1,4 +1,4 @@
-FROM golang:1.26 AS builder
+FROM golang:1.26.4 AS builder
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/lb-proxy ./cmd/proxy
