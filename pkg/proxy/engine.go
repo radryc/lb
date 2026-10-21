@@ -26,15 +26,15 @@ type ProxyMetrics struct {
 }
 
 func NewProxyMetrics(meter metric.Meter) (*ProxyMetrics, error) {
-	active, err := meter.Int64UpDownCounter("proxy_active_connections")
+	active, err := meter.Int64UpDownCounter("lb.proxy.active_connections")
 	if err != nil {
 		return nil, err
 	}
-	errs, err := meter.Int64Counter("proxy_connection_errors_total")
+	errs, err := meter.Int64Counter("lb.proxy.connection_errors.total")
 	if err != nil {
 		return nil, err
 	}
-	trips, err := meter.Int64Counter("proxy_circuit_breaker_trips_total")
+	trips, err := meter.Int64Counter("lb.proxy.circuit_breaker_trips.total")
 	if err != nil {
 		return nil, err
 	}

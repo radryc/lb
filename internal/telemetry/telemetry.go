@@ -208,7 +208,7 @@ func buildResourceAttributes(cfg Config) []attribute.KeyValue {
 		attribute.String("service.name", cfg.ServiceName),
 		attribute.String("service.version", buildinfo.Version),
 		attribute.String("service.instance.id", cfg.InstanceID),
-		attribute.String("ainfra.component", cfg.Component),
+		attribute.String("guardian.component", cfg.Component),
 	}
 	if buildinfo.Commit != "" && buildinfo.Commit != "unknown" {
 		attrs = append(attrs, attribute.String("vcs.revision", buildinfo.Commit))
