@@ -2,7 +2,7 @@
 
 ## Project shape
 
-Single Go module (`go 1.26.4`, no workspace). Four main binaries under `cmd/`:
+Single Go module (`go 1.26.10`, no workspace). Four main binaries under `cmd/`:
 
 - `cmd/registry` — gRPC control plane + HTTP `/services` state endpoint.
 - `cmd/proxy` — TCP data plane; syncs routes from registry HTTP and listens dynamically.
