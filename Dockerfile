@@ -3,7 +3,7 @@ WORKDIR /src
 COPY . .
 
 # v1.0.1 fixes otelc pinning the pre-rename module path (see monofs/Dockerfile).
-ARG OTELC_VERSION=v1.0.1
+ARG OTELC_VERSION=v1.2.0
 RUN GOBIN=/usr/local/bin go install go.opentelemetry.io/otelc/tool/cmd/otelc@${OTELC_VERSION}
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 otelc go build -o /out/lb-proxy ./cmd/proxy
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 otelc go build -o /out/lb-edge ./cmd/edge
