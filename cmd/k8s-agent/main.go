@@ -28,7 +28,7 @@ func main() {
 	otelEndpoint := envFirst("LB_OTEL_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT")
 	telemetryHandle, err := lbtelemetry.Setup(context.Background(), lbtelemetry.Config{
 		Endpoint:       otelEndpoint,
-		ServiceName:    lbtelemetry.ServiceName("lb", "OTEL_SERVICE_NAME", "LB_OTEL_SERVICE_NAME"),
+		ServiceName:    lbtelemetry.ServiceName("lb.invalid.unconfigured", "OTEL_SERVICE_NAME", "LB_OTEL_SERVICE_NAME"),
 		Component:      component,
 		InstanceID:     envOrDefault("HOSTNAME", component),
 		Insecure:       true,
