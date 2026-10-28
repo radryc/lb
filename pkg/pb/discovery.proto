@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package lb.v1;
 
-option go_package = "github.com/rydzu/ainfra/lb/pkg/pb;pb";
+option go_package = "github.com/radryc/lb/pkg/pb;pb";
 
 service DiscoveryRegistry {
   rpc RegisterService(RegisterServiceRequest) returns (RegisterServiceResponse);

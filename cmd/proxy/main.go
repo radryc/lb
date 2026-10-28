@@ -8,8 +8,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rydzu/ainfra/lb/pkg/proxy"
-	"github.com/rydzu/ainfra/lb/pkg/telemetry"
+	"github.com/radryc/lb/pkg/proxy"
+	"github.com/radryc/lb/pkg/telemetry"
 )
 
 func main() {

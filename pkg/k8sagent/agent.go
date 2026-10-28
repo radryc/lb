@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"github.com/radryc/lb/pkg/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"

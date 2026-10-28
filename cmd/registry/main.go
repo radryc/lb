@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rydzu/ainfra/lb/pkg/pb"
-	"github.com/rydzu/ainfra/lb/pkg/registry"
+	"github.com/radryc/lb/pkg/pb"
+	"github.com/radryc/lb/pkg/registry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )

@@ -1,4 +1,4 @@
-module github.com/rydzu/ainfra/lb
+module github.com/radryc/lb
 
 go 1.26.3
 

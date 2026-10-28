@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"github.com/radryc/lb/pkg/pb"
 )
 
 type GRPCServer struct {

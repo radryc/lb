@@ -490,7 +490,7 @@ const file_pkg_pb_discovery_proto_rawDesc = "" +
 	"\x11DiscoveryRegistry\x12P\n" +
 	"\x0fRegisterService\x12\x1d.lb.v1.RegisterServiceRequest\x1a\x1e.lb.v1.RegisterServiceResponse\x12V\n" +
 	"\x11DeregisterService\x12\x1f.lb.v1.DeregisterServiceRequest\x1a .lb.v1.DeregisterServiceResponse\x12G\n" +
-	"\fListServices\x12\x1a.lb.v1.ListServicesRequest\x1a\x1b.lb.v1.ListServicesResponseB&Z$github.com/rydzu/ainfra/lb/pkg/pb;pbb\x06proto3"
+	"\fListServices\x12\x1a.lb.v1.ListServicesRequest\x1a\x1b.lb.v1.ListServicesResponseB&Z$github.com/radryc/lb/pkg/pb;pbb\x06proto3"
 
 var (
 	file_pkg_pb_discovery_proto_rawDescOnce sync.Once

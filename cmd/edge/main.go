@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rydzu/ainfra/lb/pkg/pb"
-	"github.com/rydzu/ainfra/lb/pkg/proxy"
-	"github.com/rydzu/ainfra/lb/pkg/registry"
-	"github.com/rydzu/ainfra/lb/pkg/telemetry"
+	"github.com/radryc/lb/pkg/pb"
+	"github.com/radryc/lb/pkg/proxy"
+	"github.com/radryc/lb/pkg/registry"
+	"github.com/radryc/lb/pkg/telemetry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )

@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rydzu/ainfra/lb/pkg/k8sagent"
+	"github.com/radryc/lb/pkg/k8sagent"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 

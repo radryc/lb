@@ -5,8 +5,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/rydzu/ainfra/lb/pkg/model"
-	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"github.com/radryc/lb/pkg/model"
+	"github.com/radryc/lb/pkg/pb"
 )
 
 const defaultAccount = "default"
