@@ -288,17 +288,23 @@ func (e *Engine) handleConn(li *listenerInstance, clientConn net.Conn) {
 	proxyBidirectional(clientConn, backendConn)
 }
 
+const defaultProxyIdleTimeout = 5 * time.Minute
+
 func proxyBidirectional(clientConn, backendConn net.Conn) {
+	proxyBidirectionalWithTimeout(clientConn, backendConn, defaultProxyIdleTimeout)
+}
+
+func proxyBidirectionalWithTimeout(clientConn, backendConn net.Conn, idleTimeout time.Duration) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(backendConn, clientConn)
+		_, _ = copyWithIdleDeadline(backendConn, clientConn, idleTimeout)
 		if tcp, ok := backendConn.(*net.TCPConn); ok {
 			_ = tcp.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(clientConn, backendConn)
+		_, _ = copyWithIdleDeadline(clientConn, backendConn, idleTimeout)
 		if tcp, ok := clientConn.(*net.TCPConn); ok {
 			_ = tcp.CloseWrite()
 		}
@@ -306,6 +312,37 @@ func proxyBidirectional(clientConn, backendConn net.Conn) {
 	}()
 	<-done
 	<-done
+}
+
+func copyWithIdleDeadline(dst, src net.Conn, timeout time.Duration) (int64, error) {
+	if timeout <= 0 {
+		return io.Copy(dst, src)
+	}
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(timeout))
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
+			nw, werr := dst.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return written, nil
+			}
+			return written, rerr
+		}
+	}
 }
 
 func (li *listenerInstance) pickBackend() *backend {

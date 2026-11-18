@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/rydzu/ainfra/lb/pkg/pb"
@@ -81,6 +83,7 @@ func HTTPServicesHandler(state *State) http.Handler {
 			return
 		}
 		snap := state.Snapshot()
+		reqHost := sanitizeHost(r.Host)
 
 		// Group services by account, sort for stable output.
 		byAccount := map[string][]serviceUI{}
@@ -94,13 +97,8 @@ func HTTPServicesHandler(state *State) http.Handler {
 			if proto == "grpc" {
 				scheme = "grpc"
 			}
-			// Build the host from the request so the link works from any machine.
-			host := r.Host
-			if h, _, err := splitHostPort(host); err == nil {
-				host = fmt.Sprintf("%s:%d", h, svc.ExternalPort)
-			} else {
-				host = fmt.Sprintf("%s:%d", host, svc.ExternalPort)
-			}
+			// Build the host from the sanitized request host so the link works from any machine.
+			host := net.JoinHostPort(reqHost, strconv.Itoa(int(svc.ExternalPort)))
 			url := fmt.Sprintf("%s://%s", scheme, host)
 			byAccount[acc] = append(byAccount[acc], serviceUI{
 				Name:        svc.ServiceName,
@@ -138,13 +136,39 @@ type serviceUI struct {
 	URL         string
 }
 
-func splitHostPort(hostport string) (host string, port string, err error) {
-	// net.SplitHostPort wrapper used to avoid importing net in this file.
-	i := strings.LastIndex(hostport, ":")
-	if i < 0 {
-		return hostport, "", fmt.Errorf("no port")
+func sanitizeHost(raw string) string {
+	if raw == "" {
+		return "localhost"
 	}
-	return hostport[:i], hostport[i+1:], nil
+	for _, r := range raw {
+		if !isValidHostChar(r) {
+			return "localhost"
+		}
+	}
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		if h == "" {
+			return "localhost"
+		}
+		return h
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+		if inner != "" && net.ParseIP(inner) != nil {
+			return inner
+		}
+		return "localhost"
+	}
+	if strings.Contains(raw, ":") && net.ParseIP(raw) == nil {
+		return "localhost"
+	}
+	return raw
+}
+
+func isValidHostChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9') ||
+		r == '.' || r == '-' || r == ':' || r == '[' || r == ']' || r == '_'
 }
 
 type uiGroup struct {

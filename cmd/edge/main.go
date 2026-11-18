@@ -90,7 +90,14 @@ func main() {
 		}
 	}()
 
-	httpSrv := &http.Server{Addr: *registryHTTP, Handler: registry.HTTPServicesHandler(state)}
+	httpSrv := &http.Server{
+		Addr:              *registryHTTP,
+		Handler:           registry.HTTPServicesHandler(state),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("registry http exited: %v", err)

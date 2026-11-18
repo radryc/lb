@@ -15,7 +15,7 @@ Single Go module (`go 1.26.10`, no workspace). Four main binaries under `cmd/`:
 # Build everything (produces ignored root binaries /edge, /proxy, /registry, /k8s-agent)
 go build ./...
 
-# Run checks (there are currently no tests)
+# Run tests
 go test ./...
 
 # Local dev quickstart
@@ -26,7 +26,7 @@ go run ./cmd/proxy -registry-url http://127.0.0.1:8081  # metrics :9090
 go run ./cmd/edge
 ```
 
-No Makefile, CI, linter, or formatter config exists yet — `go build`/`go test` are the only verified verification steps.
+GitHub Actions CI (`.github/workflows/tests.yml`) runs `go test ./...`. No Makefile, linter, or formatter config exists — `go build` / `go test` are the primary verification steps.
 
 ## Generated code
 
