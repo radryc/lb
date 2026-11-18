@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -45,6 +46,8 @@ func main() {
 		authToken     = flag.String("auth-token", envOrDefault("LB_REGISTRY_TOKEN", ""), "optional bearer token required for registry mutations and HTTP endpoints")
 		tlsCertFile   = flag.String("tls-cert-file", envOrDefault("LB_TLS_CERT_FILE", ""), "optional TLS certificate file for registry gRPC and HTTP")
 		tlsKeyFile    = flag.String("tls-key-file", envOrDefault("LB_TLS_KEY_FILE", ""), "optional TLS private key file for registry gRPC and HTTP")
+		registryCA    = flag.String("registry-ca-file", envOrDefault("LB_REGISTRY_CA_FILE", ""), "optional CA bundle used to verify the registry TLS certificate (defaults to system roots)")
+		skipVerify    = flag.Bool("insecure-skip-verify", boolFromEnv("LB_INSECURE_SKIP_VERIFY", false), "disable registry TLS certificate verification (development only)")
 	)
 	flag.Parse()
 
@@ -152,10 +155,17 @@ func main() {
 		engine.SetRegistryToken(*authToken)
 	}
 	if certFile != "" {
+		registryTLS, err := registryTLSConfig(*registryCA, *skipVerify)
+		if err != nil {
+			log.Fatalf("configure registry TLS client: %v", err)
+		}
+		if *skipVerify {
+			log.Printf("WARNING: registry TLS certificate verification is disabled (LB_INSECURE_SKIP_VERIFY=true); do not use in production")
+		}
 		engine.SetHTTPClient(&http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: registryTLS,
 			},
 		})
 	}
@@ -273,6 +283,33 @@ func splitHostPort(raw string) (string, int, error) {
 		return "", 0, fmt.Errorf("port %d out of range", port)
 	}
 	return host, port, nil
+}
+
+// registryTLSConfig builds the TLS client configuration used to poll the
+// registry HTTP API. Certificates are verified against the system trust store
+// by default; caFile optionally replaces it with a custom CA bundle.
+// Verification is only skipped when the caller explicitly opts in.
+func registryTLSConfig(caFile string, insecureSkipVerify bool) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if insecureSkipVerify {
+		cfg.InsecureSkipVerify = true
+		return cfg, nil
+	}
+	caFile = strings.TrimSpace(caFile)
+	if caFile == "" {
+		// nil RootCAs means "use the system trust store".
+		return cfg, nil
+	}
+	pemBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA file %s: %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("CA file %s contains no usable certificates", caFile)
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
 }
 
 func envFirst(keys ...string) string {

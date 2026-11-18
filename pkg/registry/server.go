@@ -59,16 +59,13 @@ func (s *GRPCServer) ListServices(ctx context.Context, req *pb.ListServicesReque
 	return s.state.ListResponse(), nil
 }
 
-// BearerAuthUnaryInterceptor enforces bearer token authentication on mutating
-// registry RPCs (RegisterService, DeregisterService) when authToken is non-empty.
+// BearerAuthUnaryInterceptor enforces bearer token authentication on every
+// registry RPC, including read-only calls such as ListServices, when authToken
+// is non-empty. Health endpoints are served over HTTP and are exempt.
 func BearerAuthUnaryInterceptor(authToken string) grpc.UnaryServerInterceptor {
 	expected := strings.TrimSpace(authToken)
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if expected == "" {
-			return handler(ctx, req)
-		}
-		if !strings.HasSuffix(info.FullMethod, "/RegisterService") &&
-			!strings.HasSuffix(info.FullMethod, "/DeregisterService") {
 			return handler(ctx, req)
 		}
 		md, ok := metadata.FromIncomingContext(ctx)

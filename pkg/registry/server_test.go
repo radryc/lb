@@ -197,10 +197,18 @@ func TestBearerAuthUnaryInterceptor(t *testing.T) {
 		}
 	}
 
-	// ListServices is read-only and remains accessible without token.
+	// All RPCs require the token when one is configured, reads included.
 	listInfo := &grpc.UnaryServerInfo{FullMethod: "/lb.DiscoveryRegistry/ListServices"}
-	if resp, err := interceptor(context.Background(), nil, listInfo, okHandler); err != nil || resp != "ok" {
-		t.Fatalf("ListServices without token: resp=%v, err=%v", resp, err)
+	if _, err := interceptor(context.Background(), nil, listInfo, okHandler); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("ListServices without metadata: code = %v, want Unauthenticated", status.Code(err))
+	}
+	badListCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer wrong"))
+	if _, err := interceptor(badListCtx, nil, listInfo, okHandler); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("ListServices with wrong token: code = %v, want Unauthenticated", status.Code(err))
+	}
+	goodListCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+secret))
+	if resp, err := interceptor(goodListCtx, nil, listInfo, okHandler); err != nil || resp != "ok" {
+		t.Fatalf("ListServices with valid token: resp=%v, err=%v", resp, err)
 	}
 
 	// Empty configured token disables enforcement.
