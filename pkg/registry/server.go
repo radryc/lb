@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,10 @@ import (
 	"strings"
 
 	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 //go:embed design/tokens.css
@@ -52,6 +57,66 @@ func (s *GRPCServer) DeregisterService(ctx context.Context, req *pb.DeregisterSe
 
 func (s *GRPCServer) ListServices(ctx context.Context, req *pb.ListServicesRequest) (*pb.ListServicesResponse, error) {
 	return s.state.ListResponse(), nil
+}
+
+// BearerAuthUnaryInterceptor enforces bearer token authentication on mutating
+// registry RPCs (RegisterService, DeregisterService) when authToken is non-empty.
+func BearerAuthUnaryInterceptor(authToken string) grpc.UnaryServerInterceptor {
+	expected := strings.TrimSpace(authToken)
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if expected == "" {
+			return handler(ctx, req)
+		}
+		if !strings.HasSuffix(info.FullMethod, "/RegisterService") &&
+			!strings.HasSuffix(info.FullMethod, "/DeregisterService") {
+			return handler(ctx, req)
+		}
+		md, ok := metadata.FromIncomingContext(ctx)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "missing bearer token")
+		}
+		for _, auth := range md.Get("authorization") {
+			if bearerTokenMatch(auth, expected) {
+				return handler(ctx, req)
+			}
+		}
+		return nil, status.Error(codes.Unauthenticated, "invalid or missing bearer token")
+	}
+}
+
+// HTTPServicesHandlerWithAuth wraps HTTPServicesHandler with optional bearer
+// token authentication. When authToken is empty, all endpoints remain open.
+// /healthz is always exempt so liveness/readiness probes continue to work.
+func HTTPServicesHandlerWithAuth(state *State, authToken string) http.Handler {
+	base := HTTPServicesHandler(state)
+	expected := strings.TrimSpace(authToken)
+	if expected == "" {
+		return base
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			base.ServeHTTP(w, r)
+			return
+		}
+		if !bearerTokenMatch(r.Header.Get("Authorization"), expected) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="lb-registry"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		base.ServeHTTP(w, r)
+	})
+}
+
+func bearerTokenMatch(header, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	got := strings.TrimSpace(header[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
 func HTTPServicesHandler(state *State) http.Handler {

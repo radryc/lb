@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -8,6 +9,10 @@ import (
 	"testing"
 
 	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestServicesUIUsesStrataTheme(t *testing.T) {
@@ -119,5 +124,89 @@ func TestServicesUISanitizesHostHeader(t *testing.T) {
 				t.Errorf("response leaked unsanitized host in body:\n%s", body)
 			}
 		})
+	}
+}
+
+func TestHTTPServicesHandlerWithAuth(t *testing.T) {
+	state := NewState(30000, 32767)
+	const secret = "registry-secret-token"
+	handler := HTTPServicesHandlerWithAuth(state, secret)
+
+	// /healthz remains accessible without auth for probes.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /healthz without auth = %d, want 200", rec.Code)
+	}
+
+	// /services and / reject missing or wrong bearer token.
+	for _, path := range []string{"/services", "/"} {
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s without token = %d, want 401", path, rec.Code)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("GET %s with wrong token = %d, want 401", path, rec.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s with valid token = %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+func TestBearerAuthUnaryInterceptor(t *testing.T) {
+	const secret = "grpc-secret-token"
+	interceptor := BearerAuthUnaryInterceptor(secret)
+	okHandler := func(ctx context.Context, req any) (any, error) {
+		return "ok", nil
+	}
+
+	for _, method := range []string{
+		"/lb.DiscoveryRegistry/RegisterService",
+		"/lb.DiscoveryRegistry/DeregisterService",
+	} {
+		info := &grpc.UnaryServerInfo{FullMethod: method}
+
+		// Missing metadata -> Unauthenticated.
+		if _, err := interceptor(context.Background(), nil, info, okHandler); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("%s without metadata: code = %v, want Unauthenticated", method, status.Code(err))
+		}
+
+		// Wrong token -> Unauthenticated.
+		badCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer wrong"))
+		if _, err := interceptor(badCtx, nil, info, okHandler); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("%s with wrong token: code = %v, want Unauthenticated", method, status.Code(err))
+		}
+
+		// Valid token -> allowed.
+		goodCtx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+secret))
+		resp, err := interceptor(goodCtx, nil, info, okHandler)
+		if err != nil || resp != "ok" {
+			t.Fatalf("%s with valid token: resp=%v, err=%v", method, resp, err)
+		}
+	}
+
+	// ListServices is read-only and remains accessible without token.
+	listInfo := &grpc.UnaryServerInfo{FullMethod: "/lb.DiscoveryRegistry/ListServices"}
+	if resp, err := interceptor(context.Background(), nil, listInfo, okHandler); err != nil || resp != "ok" {
+		t.Fatalf("ListServices without token: resp=%v, err=%v", resp, err)
+	}
+
+	// Empty configured token disables enforcement.
+	openInterceptor := BearerAuthUnaryInterceptor("")
+	regInfo := &grpc.UnaryServerInfo{FullMethod: "/lb.DiscoveryRegistry/RegisterService"}
+	if resp, err := openInterceptor(context.Background(), nil, regInfo, okHandler); err != nil || resp != "ok" {
+		t.Fatalf("RegisterService with empty token config: resp=%v, err=%v", resp, err)
 	}
 }

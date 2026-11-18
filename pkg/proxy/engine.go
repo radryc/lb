@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +83,7 @@ type listenerInstance struct {
 type Engine struct {
 	bindAddress   string
 	registryURL   string
+	registryToken string
 	syncEvery     time.Duration
 	dialTimeout   time.Duration
 	httpClient    *http.Client
@@ -90,6 +92,23 @@ type Engine struct {
 
 	mu        sync.RWMutex
 	listeners map[int32]*listenerInstance
+}
+
+// SetRegistryToken configures an optional bearer token for polling the registry HTTP API.
+func (e *Engine) SetRegistryToken(token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.registryToken = strings.TrimSpace(token)
+}
+
+// SetHTTPClient overrides the HTTP client used to poll the registry.
+func (e *Engine) SetHTTPClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.httpClient = client
 }
 
 func NewEngine(bindAddress, registryURL string, syncEvery, dialTimeout time.Duration, metrics *ProxyMetrics, proxyProtocol bool) *Engine {
@@ -375,7 +394,14 @@ func (e *Engine) fetchSnapshot(ctx context.Context) (model.Snapshot, error) {
 	if err != nil {
 		return snapshot, err
 	}
-	resp, err := e.httpClient.Do(req)
+	e.mu.RLock()
+	token := e.registryToken
+	client := e.httpClient
+	e.mu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return snapshot, err
 	}

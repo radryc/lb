@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"github.com/rydzu/ainfra/lb/pkg/telemetry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -40,6 +42,9 @@ func main() {
 		minPort       = flag.Int("min-external-port", 1, "minimum dynamic external port")
 		maxPort       = flag.Int("max-external-port", 65535, "maximum dynamic external port")
 		proxyProtocol = flag.Bool("proxy-protocol", boolFromEnv("LB_PROXY_PROTOCOL", false), "send PROXY protocol v1 header to backends")
+		authToken     = flag.String("auth-token", envOrDefault("LB_REGISTRY_TOKEN", ""), "optional bearer token required for registry mutations and HTTP endpoints")
+		tlsCertFile   = flag.String("tls-cert-file", envOrDefault("LB_TLS_CERT_FILE", ""), "optional TLS certificate file for registry gRPC and HTTP")
+		tlsKeyFile    = flag.String("tls-key-file", envOrDefault("LB_TLS_KEY_FILE", ""), "optional TLS private key file for registry gRPC and HTTP")
 	)
 	flag.Parse()
 
@@ -77,7 +82,23 @@ func main() {
 		log.Fatalf("bootstrap invalid: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	certFile := strings.TrimSpace(*tlsCertFile)
+	keyFile := strings.TrimSpace(*tlsKeyFile)
+	if (certFile == "") != (keyFile == "") {
+		log.Fatalf("both --tls-cert-file and --tls-key-file must be set together")
+	}
+
+	grpcOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(*authToken)),
+	}
+	if certFile != "" {
+		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
+		if err != nil {
+			log.Fatalf("load TLS credentials: %v", err)
+		}
+		grpcOpts = append(grpcOpts, grpc.Creds(creds))
+	}
+	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
 	reflection.Register(grpcServer)
 	grpcLis, err := net.Listen("tcp", *registryGRPC)
@@ -92,15 +113,21 @@ func main() {
 
 	httpSrv := &http.Server{
 		Addr:              *registryHTTP,
-		Handler:           registry.HTTPServicesHandler(state),
+		Handler:           registry.HTTPServicesHandlerWithAuth(state, *authToken),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("registry http exited: %v", err)
+		var serveErr error
+		if certFile != "" {
+			serveErr = httpSrv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			serveErr = httpSrv.ListenAndServe()
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Printf("registry http exited: %v", serveErr)
 		}
 	}()
 
@@ -116,7 +143,22 @@ func main() {
 		log.Fatalf("create proxy metrics instruments: %v", err)
 	}
 
-	engine := proxy.NewEngine(*bindAddress, "http://"+*registryHTTP, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
+	registryScheme := "http://"
+	if certFile != "" {
+		registryScheme = "https://"
+	}
+	engine := proxy.NewEngine(*bindAddress, registryScheme+*registryHTTP, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
+	if strings.TrimSpace(*authToken) != "" {
+		engine.SetRegistryToken(*authToken)
+	}
+	if certFile != "" {
+		engine.SetHTTPClient(&http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		})
+	}
 	go func() {
 		if err := engine.Run(ctx); err != nil {
 			log.Printf("proxy engine exited: %v", err)
