@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,9 @@ func (m *ProxyMetrics) addTrip(ctx context.Context, backendIP string, externalPo
 type listenerInstance struct {
 	externalPort int32
 	listener     net.Listener
+	// clientTLS dials backends over TLS when non-nil. It is captured when the
+	// listener is created so a config change requires a listener restart.
+	clientTLS *tls.Config
 
 	mu       sync.RWMutex
 	backends map[string]*backend
@@ -89,6 +93,8 @@ type Engine struct {
 	httpClient    *http.Client
 	metrics       *ProxyMetrics
 	proxyProtocol bool
+	serverTLS     *tls.Config
+	clientTLS     *tls.Config
 
 	mu        sync.RWMutex
 	listeners map[int32]*listenerInstance
@@ -99,6 +105,17 @@ func (e *Engine) SetRegistryToken(token string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.registryToken = strings.TrimSpace(token)
+}
+
+// SetDataPlaneTLS enables TLS (or mTLS) on the proxied TCP data plane.
+// serverTLS wraps every external listener and clientTLS is used to dial
+// backends. Passing nil for both leaves the data plane in plaintext, which is
+// only appropriate when STRATA_TLS_MODE=off.
+func (e *Engine) SetDataPlaneTLS(serverTLS, clientTLS *tls.Config) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.serverTLS = serverTLS
+	e.clientTLS = clientTLS
 }
 
 // SetHTTPClient overrides the HTTP client used to poll the registry.
@@ -237,7 +254,13 @@ func (e *Engine) startListenerLocked(port int32) (*listenerInstance, error) {
 	li := &listenerInstance{
 		externalPort: port,
 		listener:     ln,
+		clientTLS:    e.clientTLS,
 		backends:     make(map[string]*backend),
+	}
+	if e.serverTLS != nil {
+		// Handshakes happen lazily on the first Read, so a client that speaks
+		// plaintext is rejected inside handleConn.
+		li.listener = tls.NewListener(ln, e.serverTLS)
 	}
 	go e.acceptLoop(li)
 	return li, nil
@@ -283,7 +306,7 @@ func (e *Engine) handleConn(li *listenerInstance, clientConn net.Conn) {
 		}
 	}()
 
-	backendConn, err := net.DialTimeout("tcp", b.addr(), e.dialTimeout)
+	backendConn, err := e.dialBackend(li, b)
 	if err != nil {
 		e.metrics.addError(context.Background(), b.ip, li.externalPort)
 		if b.consecFailure.Add(1) >= 3 {
@@ -307,25 +330,46 @@ func (e *Engine) handleConn(li *listenerInstance, clientConn net.Conn) {
 	proxyBidirectional(clientConn, backendConn)
 }
 
+// dialBackend connects to a backend, using TLS when the listener was
+// configured for the TLS data plane.
+func (e *Engine) dialBackend(li *listenerInstance, b *backend) (net.Conn, error) {
+	if li.clientTLS == nil {
+		return net.DialTimeout("tcp", b.addr(), e.dialTimeout)
+	}
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: e.dialTimeout},
+		Config:    li.clientTLS,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), e.dialTimeout)
+	defer cancel()
+	return dialer.DialContext(ctx, "tcp", b.addr())
+}
+
 const defaultProxyIdleTimeout = 5 * time.Minute
 
 func proxyBidirectional(clientConn, backendConn net.Conn) {
 	proxyBidirectionalWithTimeout(clientConn, backendConn, defaultProxyIdleTimeout)
 }
 
+// closeWriter is implemented by both *net.TCPConn and *tls.Conn, so the proxy
+// still half-closes correctly once the data plane is encrypted.
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func proxyBidirectionalWithTimeout(clientConn, backendConn net.Conn, idleTimeout time.Duration) {
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = copyWithIdleDeadline(backendConn, clientConn, idleTimeout)
-		if tcp, ok := backendConn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if cw, ok := backendConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = copyWithIdleDeadline(clientConn, backendConn, idleTimeout)
-		if tcp, ok := clientConn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if cw, ok := clientConn.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
