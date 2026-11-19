@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/rydzu/ainfra/lb/internal/buildinfo"
 	lbtelemetry "github.com/rydzu/ainfra/lb/internal/telemetry"
+	"github.com/rydzu/ainfra/lb/internal/tlsutil"
 	"github.com/rydzu/ainfra/lb/pkg/pb"
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"google.golang.org/grpc"
@@ -77,54 +79,48 @@ func main() {
 		log.Fatalf("both --tls-cert-file and --tls-key-file must be set together")
 	}
 
+	// Prefer the shared STRATA_TLS_* contract; fall back to the legacy
+	// LB_TLS_CERT_FILE/LB_TLS_KEY_FILE one-way TLS flags.
+	settings, err := tlsutil.Resolve(tlsutil.Legacy{CertFile: certFile, KeyFile: keyFile})
+	if err != nil {
+		log.Fatalf("configure TLS: %v", err)
+	}
+	for _, warning := range settings.Warnings {
+		log.Printf("WARNING: %s", warning)
+	}
+	tlsEnabled := settings.ServerEnabled()
+	log.Printf("registry TLS mode=%s source=%s", settings.Mode, settings.Source)
+
 	state := registry.NewState(int32(*minPort), int32(*maxPort))
-	grpcOpts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(authTokenValue)),
-	}
-	if certFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
-		if err != nil {
-			log.Fatalf("load TLS credentials: %v", err)
-		}
-		grpcOpts = append(grpcOpts, grpc.Creds(creds))
-	}
-	grpcServer := grpc.NewServer(grpcOpts...)
-	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
-	reflection.Register(grpcServer)
+	grpcServer := newRegistryGRPCServer(state, authTokenValue, settings.Server)
 
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
 		log.Fatalf("listen grpc %s: %v", *grpcAddr, err)
 	}
 
-	httpSrv := &http.Server{
-		Addr:              *httpAddr,
-		Handler:           registry.HTTPServicesHandlerWithAuth(state, authTokenValue),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+	httpSrv := newRegistryHTTPServer(*httpAddr, state, authTokenValue)
+	httpLis, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		log.Fatalf("listen http %s: %v", *httpAddr, err)
+	}
+	if settings.Server != nil {
+		httpLis = tls.NewListener(httpLis, settings.Server)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Printf("registry gRPC listening on %s (tls=%v, auth=%v)", *grpcAddr, certFile != "", authTokenValue != "")
+		log.Printf("registry gRPC listening on %s (tls=%v, auth=%v)", *grpcAddr, tlsEnabled, authTokenValue != "")
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Printf("grpc serve stopped: %v", err)
 		}
 	}()
 
 	go func() {
-		log.Printf("registry HTTP listening on %s (tls=%v, auth=%v)", *httpAddr, certFile != "", authTokenValue != "")
-		var serveErr error
-		if certFile != "" {
-			serveErr = httpSrv.ListenAndServeTLS(certFile, keyFile)
-		} else {
-			serveErr = httpSrv.ListenAndServe()
-		}
-		if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Printf("registry HTTP listening on %s (tls=%v, auth=%v)", *httpAddr, tlsEnabled, authTokenValue != "")
+		if serveErr := httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Printf("http serve stopped: %v", serveErr)
 		}
 	}()
@@ -136,6 +132,34 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+// newRegistryGRPCServer builds the registry gRPC server with bearer-token auth
+// and, when tlsCfg is non-nil, TLS or mTLS transport.
+func newRegistryGRPCServer(state *registry.State, authToken string, tlsCfg *tls.Config) *grpc.Server {
+	opts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(authToken)),
+	}
+	if tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	srv := grpc.NewServer(opts...)
+	pb.RegisterDiscoveryRegistryServer(srv, registry.NewGRPCServer(state))
+	reflection.Register(srv)
+	return srv
+}
+
+// newRegistryHTTPServer builds the registry HTTP server. TLS is applied by the
+// caller wrapping the listener with tls.NewListener.
+func newRegistryHTTPServer(addr string, state *registry.State, authToken string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           registry.HTTPServicesHandlerWithAuth(state, authToken),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 func envFirst(keys ...string) string {
