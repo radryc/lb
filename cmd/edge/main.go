@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/rydzu/ainfra/lb/internal/buildinfo"
 	lbtelemetry "github.com/rydzu/ainfra/lb/internal/telemetry"
+	"github.com/rydzu/ainfra/lb/internal/tlsutil"
 	"github.com/rydzu/ainfra/lb/pkg/pb"
 	"github.com/rydzu/ainfra/lb/pkg/proxy"
 	"github.com/rydzu/ainfra/lb/pkg/registry"
@@ -91,15 +91,32 @@ func main() {
 		log.Fatalf("both --tls-cert-file and --tls-key-file must be set together")
 	}
 
+	// Prefer the shared STRATA_TLS_* contract for both the local registry
+	// servers and the outbound registry client. The legacy LB_TLS_* and
+	// LB_REGISTRY_CA_FILE flags remain the fallback when STRATA_TLS_MODE is
+	// unset.
+	settings, err := tlsutil.Resolve(tlsutil.Legacy{
+		CertFile:           certFile,
+		KeyFile:            keyFile,
+		ClientCAFile:       *registryCA,
+		InsecureSkipVerify: *skipVerify,
+	})
+	if err != nil {
+		log.Fatalf("configure TLS: %v", err)
+	}
+	for _, warning := range settings.Warnings {
+		log.Printf("WARNING: %s", warning)
+	}
+	if settings.Source == "legacy --tls-cert-file/--tls-key-file" && *skipVerify {
+		log.Printf("WARNING: registry TLS certificate verification is disabled (LB_INSECURE_SKIP_VERIFY=true); do not use in production")
+	}
+	log.Printf("edge TLS mode=%s source=%s", settings.Mode, settings.Source)
+
 	grpcOpts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(*authToken)),
 	}
-	if certFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
-		if err != nil {
-			log.Fatalf("load TLS credentials: %v", err)
-		}
-		grpcOpts = append(grpcOpts, grpc.Creds(creds))
+	if settings.Server != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(settings.Server)))
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
@@ -122,14 +139,15 @@ func main() {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	httpLis, err := net.Listen("tcp", *registryHTTP)
+	if err != nil {
+		log.Fatalf("listen registry http %s: %v", *registryHTTP, err)
+	}
+	if settings.Server != nil {
+		httpLis = tls.NewListener(httpLis, settings.Server)
+	}
 	go func() {
-		var serveErr error
-		if certFile != "" {
-			serveErr = httpSrv.ListenAndServeTLS(certFile, keyFile)
-		} else {
-			serveErr = httpSrv.ListenAndServe()
-		}
-		if serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Printf("registry http exited: %v", serveErr)
 		}
 	}()
@@ -147,25 +165,24 @@ func main() {
 	}
 
 	registryScheme := "http://"
-	if certFile != "" {
+	if settings.Server != nil {
 		registryScheme = "https://"
 	}
 	engine := proxy.NewEngine(*bindAddress, registryScheme+*registryHTTP, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
 	if strings.TrimSpace(*authToken) != "" {
 		engine.SetRegistryToken(*authToken)
 	}
-	if certFile != "" {
-		registryTLS, err := registryTLSConfig(*registryCA, *skipVerify)
-		if err != nil {
-			log.Fatalf("configure registry TLS client: %v", err)
-		}
-		if *skipVerify {
-			log.Printf("WARNING: registry TLS certificate verification is disabled (LB_INSECURE_SKIP_VERIFY=true); do not use in production")
-		}
+	if settings.Server != nil {
+		// The data plane follows the same mode as the registry listeners:
+		// TLS whenever the process is configured for TLS, plaintext only when
+		// STRATA_TLS_MODE=off (and no legacy certificates were provided).
+		engine.SetDataPlaneTLS(settings.Server, settings.Client)
+	}
+	if settings.Client != nil {
 		engine.SetHTTPClient(&http.Client{
 			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: registryTLS,
+				TLSClientConfig: settings.Client,
 			},
 		})
 	}
@@ -285,31 +302,13 @@ func splitHostPort(raw string) (string, int, error) {
 	return host, port, nil
 }
 
-// registryTLSConfig builds the TLS client configuration used to poll the
-// registry HTTP API. Certificates are verified against the system trust store
-// by default; caFile optionally replaces it with a custom CA bundle.
-// Verification is only skipped when the caller explicitly opts in.
+// registryTLSConfig builds the legacy TLS client configuration used to poll
+// the registry HTTP API. Certificates are verified against the system trust
+// store by default; caFile optionally replaces it with a custom CA bundle.
+// Verification is only skipped when the caller explicitly opts in. It is
+// superseded by STRATA_TLS_* when STRATA_TLS_MODE is set.
 func registryTLSConfig(caFile string, insecureSkipVerify bool) (*tls.Config, error) {
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if insecureSkipVerify {
-		cfg.InsecureSkipVerify = true
-		return cfg, nil
-	}
-	caFile = strings.TrimSpace(caFile)
-	if caFile == "" {
-		// nil RootCAs means "use the system trust store".
-		return cfg, nil
-	}
-	pemBytes, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("read CA file %s: %w", caFile, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("CA file %s contains no usable certificates", caFile)
-	}
-	cfg.RootCAs = pool
-	return cfg, nil
+	return tlsutil.LegacyClientConfig(caFile, insecureSkipVerify)
 }
 
 func envFirst(keys ...string) string {
