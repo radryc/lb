@@ -12,14 +12,14 @@ Single Go module (`go 1.26.10`, no workspace). Four main binaries under `cmd/`:
 ## Everyday commands
 
 ```bash
-# Build everything (produces ignored root binaries /edge, /proxy, /registry, /k8s-agent)
+# Compile every package (the multi-package pattern writes no binaries)
 go build ./...
 
 # Run tests
 go test ./...
 
 # Local dev quickstart
-go run ./cmd/registry                 # gRPC :50051, HTTP :8081
+go run ./cmd/registry -allow-anonymous   # gRPC :50051, HTTP :8081
 go run ./cmd/proxy -registry-url http://127.0.0.1:8081  # metrics :9090
 
 # All-in-one
@@ -46,8 +46,8 @@ protoc --go_out=. --go_opt=paths=source_relative \
 ## Proxy behavior
 
 - Polls registry `/services` every `-sync-every` (default 2s) and opens/closes listeners on demand.
-- Round-robin across healthy backends; 3 consecutive dial failures trips a passive circuit breaker.
-- Draining backends are kept until active connections hit zero, then removed.
+- Round-robin across active backends; 3 consecutive dial failures trips a passive circuit breaker.
+- Draining backends receive no new connections and are removed once active connections hit zero.
 - Optional PROXY protocol v1 via `-proxy-protocol` / `LB_PROXY_PROTOCOL=true`.
 
 ## Kubernetes agent
@@ -57,7 +57,10 @@ Watches Endpoints in one namespace (default all). Intent is read from annotation
 - `guardian.intent/expose: "true"` — required to register.
 - `guardian.intent/account` — defaults to namespace.
 - `guardian.intent/service-name` — defaults to Endpoints name.
-- `guardian.intent/external-port` — optional pinned external port.
+- `guardian.intent/external-port` — optional pinned external port. On a
+  multi-port Service, the Service port whose number equals that external port
+  is the only one registered for it; an unmatched or unnamed port falls back to
+  every Endpoints port (the unmatched case logs it).
 
 Uses in-cluster config if available, otherwise `$KUBECONFIG`/`~/.kube/config`.
 
@@ -89,4 +92,5 @@ Most edge flags also accept env vars: `LB_BIND_ADDRESS`, `LB_SERVICE_BASE`, `LB_
 
 - `.gitignore` ignores the four root binary names exactly (`/edge`, `/proxy`, `/registry`, `/k8s-agent`). Pre-built binaries in the repo are artifacts and should not be committed.
 - The proxy fetches state over HTTP, but the k8s-agent writes state over gRPC; both must reach the registry.
+- The registry requires a bearer token by default (`-auth-token` / `LB_REGISTRY_TOKEN`) and refuses to start without one unless `-allow-anonymous` / `LB_ALLOW_ANONYMOUS=true` is set. The standalone `cmd/proxy` and `cmd/k8s-agent` send no token, so they only work against an anonymous registry; edge mode wires its own token into the local proxy.
 - Standalone `cmd/proxy` defaults its registry URL to `http://127.0.0.1:8081`, matching standalone `cmd/registry` defaults.

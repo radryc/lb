@@ -34,6 +34,18 @@ type Endpoint struct {
 	Port int32
 }
 
+// intent is the resolved LB registration intent for one Endpoints object.
+type intent struct {
+	account      string
+	serviceName  string
+	externalPort int32
+	// portName is the single Endpoints port that backs externalPort. Empty
+	// means "register every port" (single-port Services and manual Endpoints
+	// without a resolvable Service).
+	portName string
+	exposed  bool
+}
+
 type Agent struct {
 	client kubernetes.Interface
 	rpc    pb.DiscoveryRegistryClient
@@ -103,13 +115,13 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 	}
 
 	key := endpointResourceKey(ep.Namespace, ep.Name)
-	account, serviceName, requestedExternalPort, exposed := a.resolveIntent(ep)
-	if !exposed {
-		a.deregisterAllRetryable(ctx, key, account, serviceName)
+	in := a.resolveIntent(ep)
+	if !in.exposed {
+		a.deregisterAllRetryable(ctx, key, in.account, in.serviceName)
 		return
 	}
 
-	current := parseEndpoints(ep)
+	current := parseEndpoints(ep, in)
 	old := a.snapshotKnown(key)
 
 	// Only track successfully-registered endpoints so failures retry on next resync.
@@ -121,14 +133,14 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 			continue
 		}
 		_, err := a.rpc.RegisterService(ctx, &pb.RegisterServiceRequest{
-			Account:               account,
-			ServiceName:           serviceName,
+			Account:               in.account,
+			ServiceName:           in.serviceName,
 			TargetIp:              entry.IP,
 			TargetPort:            entry.Port,
-			RequestedExternalPort: requestedExternalPort,
+			RequestedExternalPort: in.externalPort,
 		})
 		if err != nil {
-			log.Printf("register %s/%s %s:%d failed: %v", ep.Namespace, serviceName, entry.IP, entry.Port, err)
+			log.Printf("register %s/%s %s:%d failed: %v", ep.Namespace, in.serviceName, entry.IP, entry.Port, err)
 			continue
 		}
 		newKnown[epKey] = entry
@@ -139,13 +151,13 @@ func (a *Agent) reconcile(ctx context.Context, obj interface{}) {
 			continue
 		}
 		_, err := a.rpc.DeregisterService(ctx, &pb.DeregisterServiceRequest{
-			Account:     account,
-			ServiceName: serviceName,
+			Account:     in.account,
+			ServiceName: in.serviceName,
 			TargetIp:    entry.IP,
 			TargetPort:  entry.Port,
 		})
 		if err != nil {
-			log.Printf("deregister %s/%s %s:%d failed: %v", ep.Namespace, serviceName, entry.IP, entry.Port, err)
+			log.Printf("deregister %s/%s %s:%d failed: %v", ep.Namespace, in.serviceName, entry.IP, entry.Port, err)
 			newKnown[epKey] = entry
 		}
 	}
@@ -165,8 +177,8 @@ func (a *Agent) handleDelete(ctx context.Context, obj interface{}) {
 			return
 		}
 	}
-	account, serviceName, _, _ := a.resolveIntent(ep)
-	a.deregisterAll(ctx, endpointResourceKey(ep.Namespace, ep.Name), account, serviceName)
+	in := a.resolveIntent(ep)
+	a.deregisterAll(ctx, endpointResourceKey(ep.Namespace, ep.Name), in.account, in.serviceName)
 }
 
 func (a *Agent) deregisterAll(ctx context.Context, key, account, serviceName string) {
@@ -207,50 +219,117 @@ func (a *Agent) deregisterAllRetryable(ctx context.Context, key, account, servic
 	}
 }
 
-func (a *Agent) resolveIntent(ep *corev1.Endpoints) (account string, serviceName string, requestedExternalPort int32, exposed bool) {
+func (a *Agent) resolveIntent(ep *corev1.Endpoints) intent {
 	anns := ep.GetAnnotations()
-	expose := strings.EqualFold(anns[annotationExpose], "true")
-
-	account = anns[annotationAccount]
-	if account == "" {
-		account = ep.Namespace
+	in := intent{
+		account:     anns[annotationAccount],
+		serviceName: anns[annotationServiceName],
+		exposed:     strings.EqualFold(anns[annotationExpose], "true"),
 	}
-
-	serviceName = anns[annotationServiceName]
-	if serviceName == "" {
-		serviceName = ep.Name
+	if in.account == "" {
+		in.account = ep.Namespace
 	}
-
+	if in.serviceName == "" {
+		in.serviceName = ep.Name
+	}
 	if raw := anns[annotationExternalPort]; raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil {
-			requestedExternalPort = int32(v)
+			in.externalPort = int32(v)
 		}
 	}
 
-	if !expose {
-		if svc, err := a.client.CoreV1().Services(ep.Namespace).Get(context.Background(), ep.Name, metav1.GetOptions{}); err == nil {
-			sanns := svc.GetAnnotations()
-			if strings.EqualFold(sanns[annotationExpose], "true") {
-				expose = true
-				if account == ep.Namespace && sanns[annotationAccount] != "" {
-					account = sanns[annotationAccount]
-				}
-				if serviceName == ep.Name && sanns[annotationServiceName] != "" {
-					serviceName = sanns[annotationServiceName]
-				}
-				if requestedExternalPort == 0 && sanns[annotationExternalPort] != "" {
-					if v, err := strconv.Atoi(sanns[annotationExternalPort]); err == nil {
-						requestedExternalPort = int32(v)
-					}
-				}
+	// The Service is needed both for annotation fallback and to learn which of
+	// the Endpoints ports backs the exposed external port.
+	svc, err := a.client.CoreV1().Services(ep.Namespace).Get(context.Background(), ep.Name, metav1.GetOptions{})
+	if err != nil {
+		return in
+	}
+
+	sanns := svc.GetAnnotations()
+	if !in.exposed {
+		if !strings.EqualFold(sanns[annotationExpose], "true") {
+			return in
+		}
+		in.exposed = true
+	}
+	if in.account == ep.Namespace && sanns[annotationAccount] != "" {
+		in.account = sanns[annotationAccount]
+	}
+	if in.serviceName == ep.Name && sanns[annotationServiceName] != "" {
+		in.serviceName = sanns[annotationServiceName]
+	}
+	if in.externalPort == 0 && sanns[annotationExternalPort] != "" {
+		if v, err := strconv.Atoi(sanns[annotationExternalPort]); err == nil {
+			in.externalPort = int32(v)
+		}
+	}
+	in.portName = selectPortName(svc, in.externalPort)
+	return in
+}
+
+// selectPortName picks the single Service port that backs the pinned external
+// port. Kubernetes Endpoints objects carry every port a Service defines, so
+// without this selection one external port would round-robin across unrelated
+// ports. The OTLP collector is the canonical case: it exposes gRPC 4317, HTTP
+// 4318 and health 13133, and mixing them under external port 4317 makes gRPC
+// exporters land on the HTTP receiver ("http2: frame too large").
+//
+// An empty result means "keep every port": the Service is unknown, declares no
+// ports, or declares several ports without one matching the external port (an
+// ambiguous intent, which we log but still serve the old way).
+func selectPortName(svc *corev1.Service, externalPort int32) string {
+	if svc == nil || len(svc.Spec.Ports) == 0 {
+		return ""
+	}
+	ports := svc.Spec.Ports
+	if externalPort != 0 {
+		for _, p := range ports {
+			if p.Port == externalPort {
+				return p.Name
 			}
 		}
 	}
-
-	return account, serviceName, requestedExternalPort, expose
+	if len(ports) == 1 {
+		return ports[0].Name
+	}
+	names := make([]string, 0, len(ports))
+	for _, p := range ports {
+		names = append(names, fmt.Sprintf("%s=%d", p.Name, p.Port))
+	}
+	log.Printf("service %s/%s exposes %d ports (%s) but pins external port %d to none of them; registering every endpoint port",
+		svc.Namespace, svc.Name, len(ports), strings.Join(names, ","), externalPort)
+	return ""
 }
 
-func parseEndpoints(ep *corev1.Endpoints) map[string]Endpoint {
+func parseEndpoints(ep *corev1.Endpoints, in intent) map[string]Endpoint {
+	all := parseAllEndpoints(ep)
+	if in.portName == "" || len(all) == 0 {
+		return all
+	}
+	out := make(map[string]Endpoint, len(all))
+	for _, subset := range ep.Subsets {
+		for _, addr := range subset.Addresses {
+			for _, port := range subset.Ports {
+				if port.Name != in.portName {
+					continue
+				}
+				e := Endpoint{IP: addr.IP, Port: port.Port}
+				out[endpointKey(e.IP, e.Port)] = e
+			}
+		}
+	}
+	if len(out) == 0 {
+		// Endpoint port names and Service port names are expected to match. If
+		// they do not (for example a manually managed Endpoints object without
+		// port names), fall back to every port instead of black-holing traffic.
+		log.Printf("endpoints %s/%s have no port named %q; keeping all %d endpoint ports",
+			ep.Namespace, ep.Name, in.portName, len(all))
+		return all
+	}
+	return out
+}
+
+func parseAllEndpoints(ep *corev1.Endpoints) map[string]Endpoint {
 	out := make(map[string]Endpoint)
 	for _, subset := range ep.Subsets {
 		for _, addr := range subset.Addresses {
