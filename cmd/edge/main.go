@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,11 +19,13 @@ import (
 
 	"github.com/rydzu/ainfra/lb/internal/buildinfo"
 	lbtelemetry "github.com/rydzu/ainfra/lb/internal/telemetry"
+	"github.com/rydzu/ainfra/lb/internal/tlsutil"
 	"github.com/rydzu/ainfra/lb/pkg/pb"
 	"github.com/rydzu/ainfra/lb/pkg/proxy"
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"github.com/rydzu/ainfra/lb/pkg/telemetry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -40,6 +43,11 @@ func main() {
 		minPort       = flag.Int("min-external-port", 1, "minimum dynamic external port")
 		maxPort       = flag.Int("max-external-port", 65535, "maximum dynamic external port")
 		proxyProtocol = flag.Bool("proxy-protocol", boolFromEnv("LB_PROXY_PROTOCOL", false), "send PROXY protocol v1 header to backends")
+		authToken     = flag.String("auth-token", envOrDefault("LB_REGISTRY_TOKEN", ""), "optional bearer token required for registry mutations and HTTP endpoints")
+		tlsCertFile   = flag.String("tls-cert-file", envOrDefault("LB_TLS_CERT_FILE", ""), "optional TLS certificate file for registry gRPC and HTTP")
+		tlsKeyFile    = flag.String("tls-key-file", envOrDefault("LB_TLS_KEY_FILE", ""), "optional TLS private key file for registry gRPC and HTTP")
+		registryCA    = flag.String("registry-ca-file", envOrDefault("LB_REGISTRY_CA_FILE", ""), "optional CA bundle used to verify the registry TLS certificate (defaults to system roots)")
+		skipVerify    = flag.Bool("insecure-skip-verify", boolFromEnv("LB_INSECURE_SKIP_VERIFY", false), "disable registry TLS certificate verification (development only)")
 	)
 	flag.Parse()
 
@@ -77,7 +85,40 @@ func main() {
 		log.Fatalf("bootstrap invalid: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	certFile := strings.TrimSpace(*tlsCertFile)
+	keyFile := strings.TrimSpace(*tlsKeyFile)
+	if (certFile == "") != (keyFile == "") {
+		log.Fatalf("both --tls-cert-file and --tls-key-file must be set together")
+	}
+
+	// Prefer the shared STRATA_TLS_* contract for both the local registry
+	// servers and the outbound registry client. The legacy LB_TLS_* and
+	// LB_REGISTRY_CA_FILE flags remain the fallback when STRATA_TLS_MODE is
+	// unset.
+	settings, err := tlsutil.Resolve(tlsutil.Legacy{
+		CertFile:           certFile,
+		KeyFile:            keyFile,
+		ClientCAFile:       *registryCA,
+		InsecureSkipVerify: *skipVerify,
+	})
+	if err != nil {
+		log.Fatalf("configure TLS: %v", err)
+	}
+	for _, warning := range settings.Warnings {
+		log.Printf("WARNING: %s", warning)
+	}
+	if settings.Source == "legacy --tls-cert-file/--tls-key-file" && *skipVerify {
+		log.Printf("WARNING: registry TLS certificate verification is disabled (LB_INSECURE_SKIP_VERIFY=true); do not use in production")
+	}
+	log.Printf("edge TLS mode=%s source=%s", settings.Mode, settings.Source)
+
+	grpcOpts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(*authToken)),
+	}
+	if settings.Server != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(settings.Server)))
+	}
+	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
 	reflection.Register(grpcServer)
 	grpcLis, err := net.Listen("tcp", *registryGRPC)
@@ -90,10 +131,24 @@ func main() {
 		}
 	}()
 
-	httpSrv := &http.Server{Addr: *registryHTTP, Handler: registry.HTTPServicesHandler(state)}
+	httpSrv := &http.Server{
+		Addr:              *registryHTTP,
+		Handler:           registry.HTTPServicesHandlerWithAuth(state, *authToken),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	httpLis, err := net.Listen("tcp", *registryHTTP)
+	if err != nil {
+		log.Fatalf("listen registry http %s: %v", *registryHTTP, err)
+	}
+	if settings.Server != nil {
+		httpLis = tls.NewListener(httpLis, settings.Server)
+	}
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("registry http exited: %v", err)
+		if serveErr := httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Printf("registry http exited: %v", serveErr)
 		}
 	}()
 
@@ -109,7 +164,28 @@ func main() {
 		log.Fatalf("create proxy metrics instruments: %v", err)
 	}
 
-	engine := proxy.NewEngine(*bindAddress, "http://"+*registryHTTP, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
+	registryScheme := "http://"
+	if settings.Server != nil {
+		registryScheme = "https://"
+	}
+	engine := proxy.NewEngine(*bindAddress, registryScheme+*registryHTTP, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
+	if strings.TrimSpace(*authToken) != "" {
+		engine.SetRegistryToken(*authToken)
+	}
+	if settings.Server != nil {
+		// The data plane follows the same mode as the registry listeners:
+		// TLS whenever the process is configured for TLS, plaintext only when
+		// STRATA_TLS_MODE=off (and no legacy certificates were provided).
+		engine.SetDataPlaneTLS(settings.Server, settings.Client)
+	}
+	if settings.Client != nil {
+		engine.SetHTTPClient(&http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: settings.Client,
+			},
+		})
+	}
 	go func() {
 		if err := engine.Run(ctx); err != nil {
 			log.Printf("proxy engine exited: %v", err)
@@ -224,6 +300,15 @@ func splitHostPort(raw string) (string, int, error) {
 		return "", 0, fmt.Errorf("port %d out of range", port)
 	}
 	return host, port, nil
+}
+
+// registryTLSConfig builds the legacy TLS client configuration used to poll
+// the registry HTTP API. Certificates are verified against the system trust
+// store by default; caFile optionally replaces it with a custom CA bundle.
+// Verification is only skipped when the caller explicitly opts in. It is
+// superseded by STRATA_TLS_* when STRATA_TLS_MODE is set.
+func registryTLSConfig(caFile string, insecureSkipVerify bool) (*tls.Config, error) {
+	return tlsutil.LegacyClientConfig(caFile, insecureSkipVerify)
 }
 
 func envFirst(keys ...string) string {

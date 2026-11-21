@@ -2,16 +2,23 @@ package registry
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/rydzu/ainfra/lb/pkg/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 //go:embed design/tokens.css
@@ -52,6 +59,63 @@ func (s *GRPCServer) ListServices(ctx context.Context, req *pb.ListServicesReque
 	return s.state.ListResponse(), nil
 }
 
+// BearerAuthUnaryInterceptor enforces bearer token authentication on every
+// registry RPC, including read-only calls such as ListServices, when authToken
+// is non-empty. Health endpoints are served over HTTP and are exempt.
+func BearerAuthUnaryInterceptor(authToken string) grpc.UnaryServerInterceptor {
+	expected := strings.TrimSpace(authToken)
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if expected == "" {
+			return handler(ctx, req)
+		}
+		md, ok := metadata.FromIncomingContext(ctx)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "missing bearer token")
+		}
+		for _, auth := range md.Get("authorization") {
+			if bearerTokenMatch(auth, expected) {
+				return handler(ctx, req)
+			}
+		}
+		return nil, status.Error(codes.Unauthenticated, "invalid or missing bearer token")
+	}
+}
+
+// HTTPServicesHandlerWithAuth wraps HTTPServicesHandler with optional bearer
+// token authentication. When authToken is empty, all endpoints remain open.
+// /healthz is always exempt so liveness/readiness probes continue to work.
+func HTTPServicesHandlerWithAuth(state *State, authToken string) http.Handler {
+	base := HTTPServicesHandler(state)
+	expected := strings.TrimSpace(authToken)
+	if expected == "" {
+		return base
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			base.ServeHTTP(w, r)
+			return
+		}
+		if !bearerTokenMatch(r.Header.Get("Authorization"), expected) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="lb-registry"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		base.ServeHTTP(w, r)
+	})
+}
+
+func bearerTokenMatch(header, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	const prefix = "Bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	got := strings.TrimSpace(header[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+}
+
 func HTTPServicesHandler(state *State) http.Handler {
 	mux := http.NewServeMux()
 
@@ -81,6 +145,7 @@ func HTTPServicesHandler(state *State) http.Handler {
 			return
 		}
 		snap := state.Snapshot()
+		reqHost := sanitizeHost(r.Host)
 
 		// Group services by account, sort for stable output.
 		byAccount := map[string][]serviceUI{}
@@ -94,13 +159,8 @@ func HTTPServicesHandler(state *State) http.Handler {
 			if proto == "grpc" {
 				scheme = "grpc"
 			}
-			// Build the host from the request so the link works from any machine.
-			host := r.Host
-			if h, _, err := splitHostPort(host); err == nil {
-				host = fmt.Sprintf("%s:%d", h, svc.ExternalPort)
-			} else {
-				host = fmt.Sprintf("%s:%d", host, svc.ExternalPort)
-			}
+			// Build the host from the sanitized request host so the link works from any machine.
+			host := net.JoinHostPort(reqHost, strconv.Itoa(int(svc.ExternalPort)))
 			url := fmt.Sprintf("%s://%s", scheme, host)
 			byAccount[acc] = append(byAccount[acc], serviceUI{
 				Name:        svc.ServiceName,
@@ -138,13 +198,39 @@ type serviceUI struct {
 	URL         string
 }
 
-func splitHostPort(hostport string) (host string, port string, err error) {
-	// net.SplitHostPort wrapper used to avoid importing net in this file.
-	i := strings.LastIndex(hostport, ":")
-	if i < 0 {
-		return hostport, "", fmt.Errorf("no port")
+func sanitizeHost(raw string) string {
+	if raw == "" {
+		return "localhost"
 	}
-	return hostport[:i], hostport[i+1:], nil
+	for _, r := range raw {
+		if !isValidHostChar(r) {
+			return "localhost"
+		}
+	}
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		if h == "" {
+			return "localhost"
+		}
+		return h
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+		if inner != "" && net.ParseIP(inner) != nil {
+			return inner
+		}
+		return "localhost"
+	}
+	if strings.Contains(raw, ":") && net.ParseIP(raw) == nil {
+		return "localhost"
+	}
+	return raw
+}
+
+func isValidHostChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9') ||
+		r == '.' || r == '-' || r == ':' || r == '[' || r == ']' || r == '_'
 }
 
 type uiGroup struct {

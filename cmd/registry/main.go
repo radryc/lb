@@ -2,33 +2,50 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/rydzu/ainfra/lb/internal/buildinfo"
 	lbtelemetry "github.com/rydzu/ainfra/lb/internal/telemetry"
+	"github.com/rydzu/ainfra/lb/internal/tlsutil"
 	"github.com/rydzu/ainfra/lb/pkg/pb"
 	"github.com/rydzu/ainfra/lb/pkg/registry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 )
 
 func main() {
 	var (
-		grpcAddr = flag.String("grpc-addr", ":50051", "gRPC listen address")
-		httpAddr = flag.String("http-addr", ":8081", "HTTP listen address")
-		minPort  = flag.Int("min-external-port", 10000, "minimum dynamic external port")
-		maxPort  = flag.Int("max-external-port", 60000, "maximum dynamic external port")
+		grpcAddr    = flag.String("grpc-addr", ":50051", "gRPC listen address")
+		httpAddr    = flag.String("http-addr", ":8081", "HTTP listen address")
+		minPort     = flag.Int("min-external-port", 10000, "minimum dynamic external port")
+		maxPort     = flag.Int("max-external-port", 60000, "maximum dynamic external port")
+		authToken   = flag.String("auth-token", envOrDefault("LB_REGISTRY_TOKEN", ""), "bearer token required for registry RPCs and HTTP endpoints (required unless --allow-anonymous)")
+		allowAnon   = flag.Bool("allow-anonymous", boolFromEnv("LB_ALLOW_ANONYMOUS", false), "allow unauthenticated registry access (development only)")
+		tlsCertFile = flag.String("tls-cert-file", envOrDefault("LB_TLS_CERT_FILE", ""), "optional TLS certificate file for gRPC and HTTP")
+		tlsKeyFile  = flag.String("tls-key-file", envOrDefault("LB_TLS_KEY_FILE", ""), "optional TLS private key file for gRPC and HTTP")
 	)
 	flag.Parse()
+
+	authTokenValue := strings.TrimSpace(*authToken)
+	if err := validateAuthConfig(authTokenValue, *allowAnon); err != nil {
+		log.Fatalf("%v", err)
+	}
+	if authTokenValue == "" {
+		log.Printf("WARNING: registry authentication is disabled (--allow-anonymous / LB_ALLOW_ANONYMOUS=true); do not expose this registry")
+	}
 
 	component := "lb-registry"
 	otelEndpoint := envFirst("LB_OTEL_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -56,35 +73,55 @@ func main() {
 	}
 	log.Printf("starting lb-registry version=%s commit=%s", buildinfo.Version, buildinfo.Commit)
 
+	certFile := strings.TrimSpace(*tlsCertFile)
+	keyFile := strings.TrimSpace(*tlsKeyFile)
+	if (certFile == "") != (keyFile == "") {
+		log.Fatalf("both --tls-cert-file and --tls-key-file must be set together")
+	}
+
+	// Prefer the shared STRATA_TLS_* contract; fall back to the legacy
+	// LB_TLS_CERT_FILE/LB_TLS_KEY_FILE one-way TLS flags.
+	settings, err := tlsutil.Resolve(tlsutil.Legacy{CertFile: certFile, KeyFile: keyFile})
+	if err != nil {
+		log.Fatalf("configure TLS: %v", err)
+	}
+	for _, warning := range settings.Warnings {
+		log.Printf("WARNING: %s", warning)
+	}
+	tlsEnabled := settings.ServerEnabled()
+	log.Printf("registry TLS mode=%s source=%s", settings.Mode, settings.Source)
+
 	state := registry.NewState(int32(*minPort), int32(*maxPort))
-	grpcServer := grpc.NewServer()
-	pb.RegisterDiscoveryRegistryServer(grpcServer, registry.NewGRPCServer(state))
-	reflection.Register(grpcServer)
+	grpcServer := newRegistryGRPCServer(state, authTokenValue, settings.Server)
 
 	lis, err := net.Listen("tcp", *grpcAddr)
 	if err != nil {
 		log.Fatalf("listen grpc %s: %v", *grpcAddr, err)
 	}
 
-	httpSrv := &http.Server{
-		Addr:    *httpAddr,
-		Handler: registry.HTTPServicesHandler(state),
+	httpSrv := newRegistryHTTPServer(*httpAddr, state, authTokenValue)
+	httpLis, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		log.Fatalf("listen http %s: %v", *httpAddr, err)
+	}
+	if settings.Server != nil {
+		httpLis = tls.NewListener(httpLis, settings.Server)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Printf("registry gRPC listening on %s", *grpcAddr)
+		log.Printf("registry gRPC listening on %s (tls=%v, auth=%v)", *grpcAddr, tlsEnabled, authTokenValue != "")
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Printf("grpc serve stopped: %v", err)
 		}
 	}()
 
 	go func() {
-		log.Printf("registry HTTP listening on %s", *httpAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("http serve stopped: %v", err)
+		log.Printf("registry HTTP listening on %s (tls=%v, auth=%v)", *httpAddr, tlsEnabled, authTokenValue != "")
+		if serveErr := httpSrv.Serve(httpLis); serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Printf("http serve stopped: %v", serveErr)
 		}
 	}()
 
@@ -97,6 +134,34 @@ func main() {
 	_ = httpSrv.Shutdown(shutdownCtx)
 }
 
+// newRegistryGRPCServer builds the registry gRPC server with bearer-token auth
+// and, when tlsCfg is non-nil, TLS or mTLS transport.
+func newRegistryGRPCServer(state *registry.State, authToken string, tlsCfg *tls.Config) *grpc.Server {
+	opts := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(registry.BearerAuthUnaryInterceptor(authToken)),
+	}
+	if tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	srv := grpc.NewServer(opts...)
+	pb.RegisterDiscoveryRegistryServer(srv, registry.NewGRPCServer(state))
+	reflection.Register(srv)
+	return srv
+}
+
+// newRegistryHTTPServer builds the registry HTTP server. TLS is applied by the
+// caller wrapping the listener with tls.NewListener.
+func newRegistryHTTPServer(addr string, state *registry.State, authToken string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           registry.HTTPServicesHandlerWithAuth(state, authToken),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+}
+
 func envFirst(keys ...string) string {
 	for _, key := range keys {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
@@ -104,6 +169,28 @@ func envFirst(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// validateAuthConfig rejects configurations that would silently serve the
+// registry without authentication. Anonymous access must be opted into
+// explicitly, which keeps the default deployment fail-closed.
+func validateAuthConfig(authToken string, allowAnonymous bool) error {
+	if strings.TrimSpace(authToken) != "" || allowAnonymous {
+		return nil
+	}
+	return fmt.Errorf("registry bearer token is required: set --auth-token or LB_REGISTRY_TOKEN (use --allow-anonymous or LB_ALLOW_ANONYMOUS=true for unauthenticated development only)")
+}
+
+func boolFromEnv(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func envOrDefault(key, fallback string) string {

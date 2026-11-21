@@ -5,6 +5,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/rydzu/ainfra/lb/internal/buildinfo"
 	lbtelemetry "github.com/rydzu/ainfra/lb/internal/telemetry"
+	"github.com/rydzu/ainfra/lb/internal/tlsutil"
 	"github.com/rydzu/ainfra/lb/pkg/proxy"
 	"github.com/rydzu/ainfra/lb/pkg/telemetry"
 )
@@ -70,8 +72,35 @@ func main() {
 		log.Fatalf("create proxy metrics instruments: %v", err)
 	}
 
-	engine := proxy.NewEngine(*bindAddress, *registryURL, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
-	log.Printf("proxy syncing from %s and exposing metrics at %s", *registryURL, *metricsAddr)
+	settings, err := tlsutil.Resolve(tlsutil.Legacy{})
+	if err != nil {
+		log.Fatalf("configure TLS: %v", err)
+	}
+	for _, warning := range settings.Warnings {
+		log.Printf("WARNING: %s", warning)
+	}
+	log.Printf("proxy TLS mode=%s source=%s", settings.Mode, settings.Source)
+
+	registryAddr := strings.TrimSpace(*registryURL)
+	if settings.Server != nil && strings.HasPrefix(registryAddr, "http://") {
+		registryAddr = "https://" + strings.TrimPrefix(registryAddr, "http://")
+	}
+
+	engine := proxy.NewEngine(*bindAddress, registryAddr, *syncEvery, *dialTimeout, metrics, *proxyProtocol)
+	if settings.Server != nil {
+		// TLS whenever STRATA_TLS_MODE is optional or required; plaintext only
+		// when the mode is off.
+		engine.SetDataPlaneTLS(settings.Server, settings.Client)
+	}
+	if settings.Client != nil {
+		engine.SetHTTPClient(&http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: settings.Client,
+			},
+		})
+	}
+	log.Printf("proxy syncing from %s and exposing metrics at %s", registryAddr, *metricsAddr)
 	if err := engine.Run(ctx); err != nil {
 		log.Fatalf("proxy exited: %v", err)
 	}

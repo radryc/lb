@@ -4,6 +4,7 @@ go 1.26.10
 
 require (
 	github.com/prometheus/client_golang v1.23.2
+	github.com/radryc/tlsx v0.0.0-20261119062528-06e96b34334f
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.21.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0

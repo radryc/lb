@@ -20,16 +20,16 @@ flowchart LR
 
 | Component | Binary | Responsibility |
 |---|---|---|
-| Registry | `cmd/registry` | gRPC `DiscoveryRegistry` (`RegisterService`, `DeregisterService`, `ListServices`), HTTP `/services` snapshot, `/healthz`, and a service dashboard |
+| Registry | `cmd/registry` | gRPC `DiscoveryRegistry` (`RegisterService`, `DeregisterService`, `ListServices`), HTTP `/services` snapshot, `/healthz`, and a service dashboard. Bearer-token authentication is required (health checks excepted) unless `-allow-anonymous` (or `LB_ALLOW_ANONYMOUS=true`) is set. |
 | Proxy | `cmd/proxy` | Polls the registry snapshot, opens listeners per external port, round-robins across healthy backends, passive circuit breaking, draining, optional PROXY protocol v1 |
 | Kubernetes agent | `cmd/k8s-agent` | Watches Endpoints objects and registers/deregisters their addresses from annotations |
 | Edge | `cmd/edge` | All-in-one registry plus proxy used as the container entrypoint |
 
 ### Data flow
 
-1. A producer registers one or more backends for an external port. The registry assigns a port from the configured range when the intent does not pin one, and tracks each backend's health and draining state.
+1. A producer registers one or more backends for an external port. The registry assigns a port from the configured range when the intent does not pin one and stores the resulting route; the proxy tracks backend health and draining state.
 2. The proxy syncs `GET /services` every `--sync-every` (default `2s`). It opens a listener for new external ports and closes listeners that no longer have backends.
-3. Connections are balanced round-robin. Three consecutive dial failures trip a passive circuit breaker for that backend. Draining backends stay in rotation until their active connections reach zero.
+3. Connections are balanced round-robin across active backends. Three consecutive dial failures trip a passive circuit breaker for that backend. Draining backends stop receiving new connections and are removed once their active connections reach zero.
 4. Metrics are exported in Prometheus format on `:9090` for the standalone proxy and `:19090` for edge mode.
 
 ### Kubernetes intent
@@ -43,16 +43,28 @@ The agent reads the following annotations from the **Endpoints** object, falling
 | `guardian.intent/service-name` | Service name, defaults to the Endpoints name |
 | `guardian.intent/external-port` | Optional pinned external port |
 
+When a Service exposes several ports, the agent selects the Service port whose
+port number equals the pinned external port and registers only the Endpoints
+port that has the same name, so one external port is never balanced across
+unrelated receivers. A single-port Service resolves to that port. If no Service
+port matches, or the selected name is absent from the Endpoints object, the
+agent logs the ambiguity and falls back to every Endpoint port; an unnamed
+selected Service port also falls back, without a log line.
+
 ## Quick start
 
 ```bash
-go run ./cmd/registry
+go run ./cmd/registry -allow-anonymous
 # in another shell
 go run ./cmd/proxy -registry-url http://127.0.0.1:8081
 ```
 
 The standalone registry listens on gRPC `:50051` and HTTP `:8081`; the proxy
-exports metrics on `:9090`.
+exports metrics on `:9090`. The registry requires a bearer token by default
+(`-auth-token` or `LB_REGISTRY_TOKEN`); `-allow-anonymous` is the local
+development opt-out. The standalone `cmd/proxy` has no token flag, so it can
+only poll an anonymous registry; edge mode uses its own `-auth-token` for both
+its registry API and the proxy's `/services` poll.
 
 ## Edge mode
 
