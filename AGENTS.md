@@ -92,5 +92,7 @@ Most edge flags also accept env vars: `LB_BIND_ADDRESS`, `LB_SERVICE_BASE`, `LB_
 
 - `.gitignore` ignores the four root binary names exactly (`/edge`, `/proxy`, `/registry`, `/k8s-agent`). Pre-built binaries in the repo are artifacts and should not be committed.
 - The proxy fetches state over HTTP, but the k8s-agent writes state over gRPC; both must reach the registry.
-- The registry requires a bearer token by default (`-auth-token` / `LB_REGISTRY_TOKEN`) and refuses to start without one unless `-allow-anonymous` / `LB_ALLOW_ANONYMOUS=true` is set. The standalone `cmd/proxy` and `cmd/k8s-agent` send no token, so they only work against an anonymous registry; edge mode wires its own token into the local proxy.
+- The registry requires a bearer token by default (`-auth-token` / `LB_REGISTRY_TOKEN`) and refuses to start without one unless `-allow-anonymous` / `LB_ALLOW_ANONYMOUS=true` is set. This applies to standalone `cmd/registry`. The `lb-edge` image does **not** fail closed: `-auth-token` defaults empty and is not validated. The standalone `cmd/proxy` and `cmd/k8s-agent` send no token, so they only work against an anonymous registry.
+- All binaries resolve TLS through `internal/tlsutil` (`STRATA_TLS_*`, with `LB_TLS_CERT_FILE`/`LB_TLS_KEY_FILE`/`LB_REGISTRY_CA_FILE` as fallbacks). Edge applies the resolved server/client config to proxy listeners via `SetDataPlaneTLS`. `STRATA_TLS_MODE` overrides the legacy flags and makes `LB_INSECURE_SKIP_VERIFY` a no-op.
+- OTLP export uses `LB_OTEL_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`; the image builds with `otelc`.
 - Standalone `cmd/proxy` defaults its registry URL to `http://127.0.0.1:8081`, matching standalone `cmd/registry` defaults.

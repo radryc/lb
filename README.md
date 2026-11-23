@@ -20,7 +20,7 @@ flowchart LR
 
 | Component | Binary | Responsibility |
 |---|---|---|
-| Registry | `cmd/registry` | gRPC `DiscoveryRegistry` (`RegisterService`, `DeregisterService`, `ListServices`), HTTP `/services` snapshot, `/healthz`, and a service dashboard. Bearer-token authentication is required (health checks excepted) unless `-allow-anonymous` (or `LB_ALLOW_ANONYMOUS=true`) is set. |
+| Registry | `cmd/registry` | gRPC `DiscoveryRegistry` (`RegisterService`, `DeregisterService`, `ListServices`), HTTP `/services` snapshot, `/healthz`, and a service dashboard. `cmd/registry` requires a bearer token (health checks exempt) unless `-allow-anonymous`/`LB_ALLOW_ANONYMOUS=true`; the edge binary does **not** fail closed by default — set `-auth-token`/`LB_REGISTRY_TOKEN` explicitly. |
 | Proxy | `cmd/proxy` | Polls the registry snapshot, opens listeners per external port, round-robins across healthy backends, passive circuit breaking, draining, optional PROXY protocol v1 |
 | Kubernetes agent | `cmd/k8s-agent` | Watches Endpoints objects and registers/deregisters their addresses from annotations |
 | Edge | `cmd/edge` | All-in-one registry plus proxy used as the container entrypoint |
@@ -60,11 +60,15 @@ go run ./cmd/proxy -registry-url http://127.0.0.1:8081
 ```
 
 The standalone registry listens on gRPC `:50051` and HTTP `:8081`; the proxy
-exports metrics on `:9090`. The registry requires a bearer token by default
-(`-auth-token` or `LB_REGISTRY_TOKEN`); `-allow-anonymous` is the local
+exports metrics on `:9090`. The standalone registry requires a bearer token by
+default (`-auth-token` or `LB_REGISTRY_TOKEN`); `-allow-anonymous` is the local
 development opt-out. The standalone `cmd/proxy` has no token flag, so it can
-only poll an anonymous registry; edge mode uses its own `-auth-token` for both
-its registry API and the proxy's `/services` poll.
+only poll an anonymous registry.
+
+`lb-edge` (the container default) has **no fail-closed auth**: `-auth-token`
+defaults empty and is not validated. Set `LB_REGISTRY_TOKEN` (or `-auth-token`)
+when exposing the edge registry; the same token is used for its registry API and
+the local proxy's `/services` poll.
 
 ## Edge mode
 
@@ -91,6 +95,32 @@ Most edge flags also accept environment variables: `LB_BIND_ADDRESS`,
 `LB_SERVICE_BASE`, `LB_ACCOUNT`, `LB_BOOTSTRAP`, `LB_METRICS_ADDR`,
 `LB_REGISTRY_HTTP_ADDR`, `LB_REGISTRY_GRPC_ADDR`, `LB_SYNC_EVERY`,
 `LB_DIAL_TIMEOUT`, `LB_PROXY_PROTOCOL`.
+
+External-port allocation ranges: standalone `cmd/registry` defaults to
+`10000–60000` (`--min-external-port`/`--max-external-port`); edge defaults to
+`1–65535`. A pinned port may be any free port in `1–65535`.
+
+### TLS, mTLS, and telemetry
+
+All binaries resolve TLS through `internal/tlsutil`, which prefers the shared
+`STRATA_TLS_*` contract and falls back to legacy flags:
+
+| Purpose | Legacy flag | Env |
+| --- | --- | --- |
+| Registry / edge server cert | `--tls-cert-file` | `LB_TLS_CERT_FILE` |
+| Server key | `--tls-key-file` | `LB_TLS_KEY_FILE` |
+| Verify the registry from edge | `--registry-ca-file` | `LB_REGISTRY_CA_FILE` |
+| Skip registry verification (dev only) | `--insecure-skip-verify` | `LB_INSECURE_SKIP_VERIFY` |
+
+When `STRATA_TLS_MODE` is set, it overrides the legacy flags, peer certificates
+are always verified, and `LB_INSECURE_SKIP_VERIFY` is ignored. Edge passes the
+resolved server/client config to the proxy listeners via `SetDataPlaneTLS`, so
+the proxied TCP data plane can also use TLS.
+
+OTLP export is enabled with `LB_OTEL_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_ENDPOINT`; `LB_OTEL_SERVICE_NAME`/`OTEL_SERVICE_NAME` and
+`LB_OTEL_METRIC_INTERVAL` tune it. The container image builds with `otelc`
+instrumentation.
 
 ## Build and test
 
